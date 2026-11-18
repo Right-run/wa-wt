@@ -19,10 +19,6 @@ Note: PowerShell 5 encoding format should be UTF-8 with BOM, PowerShell 7 can us
 
 This version has removed scenes/buildings/vegetation
 
-Current issues:
-
-Vertex stream declaration format=14, stride=20, format14 is not listed in the format table. Within 20 bytes, need to place 3 vertex components (6 or 12 bytes) + 2 UV components (4 or 8 bytes) [Parsed by DSH, the author has not verified but the error exists, affecting about 20 fields of the same layout]
-
 VROMFS和BLK文件解包器，，但此版仅兼容.json语法，优化了多线程算法，新增.obj模型导出，主体为https://github.com/Warthunder-Open-Source-Foundation/wt_ext_cli
 
 在这里非常感谢DeepSeek Harness及DeepSeek开发人员，此项目由DeepSeek-V4.1-Flash修缮约70%
