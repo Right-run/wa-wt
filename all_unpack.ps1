@@ -96,8 +96,8 @@ $WantClean = $false
 if ($Mode -in @("1", "2")) {
     Write-Host ""
     Write-Host "[*] 请选择要导出的模型类型：" -ForegroundColor Yellow
-    Write-Host "  1 - 满挂载（含飞行特效面 / 挂架 / 武器 / 吊舱）" -ForegroundColor Green
-    Write-Host "  2 - 纯机体（只清理飞机：剔除默认隐藏的挂架/吊舱/特效面；坦克、舰船、场景等原样保留）" -ForegroundColor Green
+    Write-Host "  1 - 满挂载（含挂架/武器/吊舱；特效面已剔除；座舱独立 OBJ 不导出）" -ForegroundColor Green
+    Write-Host "  2 - 纯机体（剔除默认隐藏的挂架/吊舱；场景/树木/座舱独立 OBJ 不导出）" -ForegroundColor Green
     $mKind = ""
     while ($mKind -notin @("1", "2")) {
         $mKind = [string](Read-Host "  请输入 (1/2，默认 1 满挂载)")
@@ -107,9 +107,11 @@ if ($Mode -in @("1", "2")) {
 }
 
 # ---------- 汇总确认 ----------
-$outRoot    = Join-Path $OutDir "config"        # 配置文件解包目录
-$modelsDir  = Join-Path $OutDir "models"        # 最终模型目录（满挂载 或 纯机体）
-$fullTmpDir = Join-Path $OutDir "_full_tmp"     # 纯机体模式的中转（先导满挂载再清理）
+$outRoot      = Join-Path $OutDir "config"        # 配置文件解包目录
+$modelsDir    = Join-Path $OutDir "models"        # 纯机体最终目录
+$modelsFullDir = Join-Path $OutDir "models_full"  # 满挂载目录（保留，不再删除）
+$weaponsDir   = Join-Path $OutDir "weapons"       # 单独武器建模目录（PL-12/GB250 等）
+$fullTmpDir   = $modelsFullDir                    # 兼容旧变量名：纯机体模式的满挂载源
 $wantConfig = $Mode -in @("1", "3")   # 是否解包配置文件
 $wantModel  = $Mode -in @("1", "2")   # 是否导出模型
 $totalSteps = 0
@@ -121,7 +123,8 @@ Write-Host ""
 Write-Host "  输入路径（游戏目录）：$GameDir" -ForegroundColor DarkGray
 Write-Host "  输出路径（输出目录）：$OutDir" -ForegroundColor DarkGray
 Write-Host "  配置文件目录：$outRoot" -ForegroundColor DarkGray
-Write-Host "  模型目录：    $modelsDir" -ForegroundColor DarkGray
+Write-Host "  纯机体目录：  $modelsDir" -ForegroundColor DarkGray
+Write-Host "  满挂载目录：  $modelsFullDir" -ForegroundColor DarkGray
 $modeName = @{ "1" = "完整输出"; "2" = "只输出模型"; "3" = "只输出配置文件" }[$Mode]
 Write-Host "  输出模式：$modeName" -ForegroundColor DarkGray
 Write-Host "  已完成项：$(if ($ForceRedo) { '强制重做' } else { '跳过' })" -ForegroundColor DarkGray
@@ -206,8 +209,9 @@ if ($wantModel) {
         Write-Host "[错误] 找不到模型导出脚本：$exportPy" -ForegroundColor Red
         $stepModelOk = $false
     } else {
-        # 纯机体模式：先导满挂载到中转目录再清理输出到最终 models；满挂载模式：直接导到 models
-        $exportTarget = if ($WantClean) { $fullTmpDir } else { $modelsDir }
+        # 纯机体：先导满挂载到 models_full，再清理输出 models；满挂载：只导 models_full。
+        # 两套目录都保留，不再删除满挂载源。
+        $exportTarget = if ($WantClean) { $fullTmpDir } else { $modelsFullDir }
         New-Item -ItemType Directory -Path $modelsDir -Force | Out-Null
         New-Item -ItemType Directory -Path $exportTarget -Force | Out-Null
 
@@ -228,11 +232,17 @@ if ($wantModel) {
                 }
             }
         }
-        Write-Host "  调用：python $exportPy --all --game-dir $GameDir --out $exportTarget" -ForegroundColor DarkGray
+        $pyExe = (Get-Command python -ErrorAction SilentlyContinue | Select-Object -First 1).Source
+        if (-not $pyExe) {
+            Write-Host "[错误] PATH 中找不到 python，无法导出模型。" -ForegroundColor Red
+            $stepModelOk = $false
+        } else {
+        Write-Host "  调用：$pyExe $exportPy --all --no-base --no-cockpit --allow-failures --game-dir $GameDir --out $exportTarget" -ForegroundColor DarkGray
         Write-Host ""
-        $pyArgs = @($exportPy, "--all", "--game-dir", $GameDir, "--out", $exportTarget)
+        $pyArgs = @($exportPy, "--all", "--no-base", "--no-cockpit", "--allow-failures", "--game-dir", $GameDir, "--out", $exportTarget)
         if ($ForceRedo) { $pyArgs += "--no-skip" }
-        & python @pyArgs 2>&1 | Tee-Object -FilePath $modelLog
+        $LASTEXITCODE = 0
+        & $pyExe @pyArgs 2>&1 | ForEach-Object { $ln = $_; Write-Host $ln; $ln | Out-File -FilePath $modelLog -Append -Encoding utf8 }
         $exportCode = $LASTEXITCODE
 
         if ($exportCode -ne 0) {
@@ -241,19 +251,19 @@ if ($wantModel) {
             $stepModelOk = $false
         } elseif ($WantClean) {
             Write-Host ""
-            Write-Host "  满挂载导出完成，开始生成纯机体（只清理飞机；坦克/舰船/场景等原样保留）..." -ForegroundColor Green
+            Write-Host "  满挂载导出完成，开始生成纯机体（只清理飞机；场景/树木等 base 资源不导出）..." -ForegroundColor Green
             if (-not (Test-Path -LiteralPath $cleanPy)) {
                 Write-Host "  [错误] 找不到清理脚本：$cleanPy" -ForegroundColor Red
                 $stepModelOk = $false
             } else {
-                Write-Host "  调用：python $cleanPy --batch $fullTmpDir $modelsDir --config $outRoot" -ForegroundColor DarkGray
+                Write-Host "  调用：$pyExe $cleanPy --batch $fullTmpDir $modelsDir --config $outRoot --aircraft-body-only" -ForegroundColor DarkGray
                 Write-Host ""
-                & python $cleanPy --batch $fullTmpDir $modelsDir --config $outRoot 2>&1 | Tee-Object -FilePath $modelLog -Append
+                $LASTEXITCODE = 0
+                & $pyExe $cleanPy --batch $fullTmpDir $modelsDir --config $outRoot --aircraft-body-only 2>&1 | ForEach-Object { $ln = $_; Write-Host $ln; $ln | Out-File -FilePath $modelLog -Append -Encoding utf8 }
                 $cleanCode = $LASTEXITCODE
                 if ($cleanCode -eq 0) {
-                    Remove-Item -LiteralPath $fullTmpDir -Recurse -Force -ErrorAction SilentlyContinue
                     Write-Host ""
-                    Write-Host "  纯机体导出完成 -> $modelsDir（中转满挂载目录已自动清理）" -ForegroundColor Green
+                    Write-Host "  纯机体导出完成 -> $modelsDir（满挂载源保留在 $modelsFullDir）" -ForegroundColor Green
                 } else {
                     Write-Host "  [失败] 纯机体导出退出码：$cleanCode，中转目录保留：$fullTmpDir" -ForegroundColor Red
                     $stepModelOk = $false
@@ -261,7 +271,28 @@ if ($wantModel) {
             }
         } else {
             Write-Host ""
-            Write-Host "  满挂载模型导出完成 -> $modelsDir" -ForegroundColor Green
+            Write-Host "  满挂载模型导出完成 -> $modelsFullDir" -ForegroundColor Green
+        }
+
+        # 单独武器建模：PL-12/PL-12A/GB250 等资源在 aces.grp，不能混入纯机体。
+        $aces = Join-Path $GameDir "content\base\res\aces.grp"
+        if (Test-Path -LiteralPath $aces) {
+            $weaponsLog = Join-Path $LogDir "weapons_$stamp.log"
+            $weaponsPacks = Join-Path $LogDir "weapons_packs_$stamp.txt"
+            # PS 5.1 的 Set-Content -Encoding UTF8 会写 BOM；export_models 按普通 utf-8 读取时
+            # BOM 会粘在路径首字符，导致 relpath 跨盘错误。这里写无 BOM UTF-8。
+            [System.IO.File]::WriteAllText($weaponsPacks, $aces + [Environment]::NewLine,
+                (New-Object System.Text.UTF8Encoding($false)))
+            New-Item -ItemType Directory -Path $weaponsDir -Force | Out-Null
+            $wargs = @($exportPy, "--type", "ALL", "--game-dir", $GameDir, "--out", $weaponsDir, "--packs-file", $weaponsPacks, "--allow-failures")
+            if ($ForceRedo) { $wargs += "--no-skip" }
+            Write-Host "  导出单独武器建模 -> $weaponsDir" -ForegroundColor DarkGray
+            $LASTEXITCODE = 0
+            & $pyExe @wargs 2>&1 | ForEach-Object { $ln = $_; Write-Host $ln; $ln | Out-File -FilePath $weaponsLog -Append -Encoding utf8 }
+            if ($LASTEXITCODE -ne 0) { Write-Host "  [警告] 单独武器导出返回码：$LASTEXITCODE" -ForegroundColor Yellow }
+        } else {
+            Write-Host "  [警告] 未找到 aces.grp，跳过单独武器导出" -ForegroundColor Yellow
+        }
         }
         Write-Host "  日志：$modelLog" -ForegroundColor DarkGray
     }
@@ -283,8 +314,13 @@ if ($anyFail) {
 }
 if ($wantConfig) { Write-Host "  配置文件目录：$outRoot" -ForegroundColor DarkGray }
 if ($wantModel) {
-    $mType = if ($WantClean) { "纯机体（仅飞机已剔除挂架/吊舱/特效面；其他类型原样）" } else { "满挂载" }
-    Write-Host "  模型目录：$modelsDir  [$mType]" -ForegroundColor DarkGray
+    if ($WantClean) {
+        Write-Host "  纯机体目录：$modelsDir（结构件/舱门保留；特效面已剔除）" -ForegroundColor DarkGray
+        Write-Host "  满挂载目录：$modelsFullDir（保留原始挂载）" -ForegroundColor DarkGray
+        Write-Host "  武器目录：  $weaponsDir（PL-12/PL-12A/GB250 等）" -ForegroundColor DarkGray
+    } else {
+        Write-Host "  满挂载目录：$modelsFullDir" -ForegroundColor DarkGray
+    }
 }
 Write-Host "  日志目录：$LogDir" -ForegroundColor DarkGray
 Write-Host ""

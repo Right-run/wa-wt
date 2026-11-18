@@ -32,8 +32,22 @@ NAME_EXCL = re.compile(
 
 BLK_HIDE_KEYS = ("HideNodes", "HideDmParts")   # WeaponSlots 下“默认隐藏”的两个字段
 
-# 例外：命中即保留（理由见文件头“例外”一节）
-KEEP_EXCEPTIONS = re.compile(r"^rotor")
+# 例外：命中即保留。除旋翼外，游戏 HideNodes/HideDmParts 里混有真实结构件
+# （起落架舱门 gear_*、舱盖 hatch*、减速板 airbrake*、前缘缝翼 slat*、panel/cover 等），
+# 这些不能被默认隐藏表删除。
+KEEP_EXCEPTIONS = re.compile(
+    r"^rotor|(^|_)(gear|wheel|door|bay|hatch|canopy|airbrake|slat|flap|aileron|rudder|elevator|panel|cover|undercarriage|chassis)(_|$)",
+    re.IGNORECASE)
+
+
+def keep_group(name):
+    """结构件白名单：隐藏表/名称规则命中时也保留；发射架/挂架上的 gear 仍按武器处理。"""
+    n = (name or "").strip().lower()
+    if not n:
+        return False
+    if "launcher" in n or "pylon" in n:
+        return False
+    return bool(KEEP_EXCEPTIONS.search(n))
 
 
 # --------------------------------------------------------------------------
@@ -221,13 +235,13 @@ def _obj_group_names(path, cap=40000):
     return gs
 
 
-def resolve_aircraft(obj_path, hide_index):
+def resolve_aircraft(obj_path, hide_index, aircraft_names=None):
     """OBJ -> 飞行模型 BLK 的两级配对，返回 (隐藏节点集, 机型键)，不可信则 (None, None)。
 
     1) 精确名；2) 变体前缀（资源 saab_a32a ↔ BLK saab_a32a_red_adam）+ 组名重叠校验：
     前缀不足以判定机体——吊舱/副油箱共享同一前缀。实测机体重叠 3~149、配件 0~1，故取 >=2。
     """
-    if not hide_index:
+    if not hide_index and not aircraft_names:
         return None, None
     key_path = os.path.abspath(obj_path)
     if key_path in _RESOLVE_CACHE:
@@ -253,6 +267,12 @@ def resolve_aircraft(obj_path, hide_index):
             keys += [k for k in hide_index if k.startswith(c + "_") or c.startswith(k + "_")]
     keys = sorted(set(keys))
     if not keys:
+        # 没有隐藏节点表的机体（830 个 BLK 无 WeaponSlots）也要按机体清理名称规则，
+        # 否则会被当成“非飞机”原样复制，炸弹/挂架全部残留。
+        if aircraft_names and name in aircraft_names:
+            res = (frozenset(), name)
+            _RESOLVE_CACHE[key_path] = res
+            return res
         _RESOLVE_CACHE[key_path] = (None, None)
         return None, None
     gs = _obj_group_names(obj_path)
@@ -303,7 +323,7 @@ def clean_one(src, dst, hide_index=None, report=None, hide=None):
         s = line[:2]
         if line[:2] == "g ":
             g = line[2:].strip()
-            if KEEP_EXCEPTIONS.search(g):
+            if keep_group(g):
                 keep = True
             else:
                 keep = not (g in hide or NAME_EXCL.search(g))
@@ -365,7 +385,7 @@ def _batch_worker_part(files, srcd, dstd, index_path, stat_path, log_path, wid):
     for p in files:
         o = os.path.join(dstd, os.path.relpath(p, srcd))
         n += 1
-        hide, _key = resolve_aircraft(p, hide_index)
+        hide, _key = resolve_aircraft(p, hide_index, aircraft_names)
         if hide is None:
             copy_through(p, o)
             n_passed += 1
@@ -452,6 +472,25 @@ def batch_parallel(files, srcd, dstd, hide_index, aircraft_names, workers, verbo
     return st["n"], st["cleaned"], st["passed"], st["by_data"], st["by_name"], st["groups"]
 
 
+def prune_aircrafts(aircrafts_dir, aircraft_names):
+    """纯机体目录只保留完整飞机机体：删除 aircrafts 下武器/挂架/X-ray/组件等独立 OBJ。
+    不触碰 tanks/ships/cockpits 等其他目录。"""
+    if not aircraft_names or not os.path.isdir(aircrafts_dir):
+        return 0
+    removed = 0
+    for root, _dirs, files in os.walk(aircrafts_dir):
+        for fn in files:
+            if not fn.lower().endswith(".obj"):
+                continue
+            if model_name_of(fn) not in aircraft_names:
+                try:
+                    os.remove(os.path.join(root, fn))
+                    removed += 1
+                except OSError:
+                    pass
+    return removed
+
+
 def main():
     ap = argparse.ArgumentParser(description="纯机体清理：剔除非机体件（游戏默认隐藏节点 + 特效面/外挂物）")
     ap.add_argument("--batch", nargs=2, metavar=("SRC_DIR", "DST_DIR"),
@@ -460,6 +499,8 @@ def main():
                     help="config 解包目录（含 aces.vromfs.bin\\...\\gamedata\\flightmodels），"
                          "默认 <项目根>\\output\\config")
     ap.add_argument("--verbose", action="store_true", help="打印每个文件被剔除的组名")
+    ap.add_argument("--aircraft-body-only", action="store_true",
+                    help="清理后从目标 aircrafts 目录删除非完整机体的独立 OBJ（武器/挂架/X-ray/组件）")
     ap.add_argument("--workers", default="auto",
                     help="批处理并行进程数：auto（默认，min(CPU,8)）或 1..32；1 = 旧的串行行为")
     ap.add_argument("src", nargs="?", help="单个源 OBJ")
@@ -486,6 +527,9 @@ def main():
             print("batch done: %d files -> %s" % (n, dstd))
             print("  飞机清理 %d 个（剔除组：游戏默认隐藏 %d + 名称规则 %d，合计 %d）；"
                   "非飞机原样复制 %d 个" % (n_cleaned, n_by_data, n_by_name, n_groups, n_passed))
+            if args.aircraft_body_only:
+                removed = prune_aircrafts(os.path.join(dstd, "content", "base", "res", "aircrafts"), aircraft_names)
+                print("  纯机体：删除 aircrafts 下非完整机体独立 OBJ %d 个" % removed)
             return
         n = 0
         n_cleaned = n_passed = 0
@@ -493,7 +537,7 @@ def main():
         for p in files:
             o = os.path.join(dstd, os.path.relpath(p, srcd))                   # 保留相对目录结构
             n += 1
-            hide, _key = resolve_aircraft(p, hide_index)
+            hide, _key = resolve_aircraft(p, hide_index, aircraft_names)
             if hide is None:                                                   # 非机体：原样复制
                 copy_through(p, o)
                 n_passed += 1
@@ -515,10 +559,13 @@ def main():
         print("batch done: %d files -> %s" % (n, dstd))
         print("  飞机清理 %d 个（剔除组：游戏默认隐藏 %d + 名称规则 %d，合计 %d）；"
               "非飞机原样复制 %d 个" % (n_cleaned, n_by_data, n_by_name, n_groups, n_passed))
+        if args.aircraft_body_only:
+            removed = prune_aircrafts(os.path.join(dstd, "content", "base", "res", "aircrafts"), aircraft_names)
+            print("  纯机体：删除 aircrafts 下非完整机体独立 OBJ %d 个" % removed)
     else:
         if not args.src or not args.dst:
             ap.error("单文件用法：_export_clean.py <src.obj> <dst.obj>；批量用法：--batch <src目录> <dst目录>")
-        hide, key = resolve_aircraft(args.src, hide_index)
+        hide, key = resolve_aircraft(args.src, hide_index, aircraft_names)
         if hide is None:
             copy_through(args.src, args.dst)
             print("非机体资源：原样复制（未做任何删改）-> %s" % args.dst)

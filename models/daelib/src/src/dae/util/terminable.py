@@ -142,7 +142,14 @@ class FilePathable:
 		
 		self.__filePath = filePath
 		self.__name = name
-		self.__size = size if size > 0 else stat(filePath).st_size
+		# filePath 可能为 None（包内资源/未落盘资源）；原实现对 None 调 stat 会抛
+		# "stat: path should be string..."，导致整份资源导出失败。
+		if size > 0:
+			self.__size = size
+		elif filePath is not None:
+			self.__size = stat(filePath).st_size
+		else:
+			self.__size = 0
 
 	@property
 	def name(self):

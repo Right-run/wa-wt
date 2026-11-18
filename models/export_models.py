@@ -127,13 +127,17 @@ def list_pack(pack_path):
     return grp, names, skel_names
 
 
-def export_names(grp, names, skel_names, sub_out, stem, lod, no_skip):
-    """导出一批资源，返回 (ok, fail, skip, lines)。lines 为逐条结果文本（供 worker 落盘）。"""
+def export_names(grp, names, skel_names, sub_out, stem, lod, no_skip, no_cockpit=False):
+    """导出一批资源，返回 (ok, fail, skip, lines)。lines 为逐条结果文本（供 worker 落盘）。
+    no_cockpit=True 时跳过所有独立座舱资源（name 含 _cockpit）。"""
     ok = fail = skip = 0
     lines = []
     for name in names:
+        if no_cockpit and re.search(r"(^|_)cockpit($|_)", name, re.IGNORECASE):
+            skip += 1
+            continue
         out_path = os.path.join(sub_out, "%s__%s_LOD%d.obj" % (stem, safe_name(name), lod))
-        if os.path.exists(out_path) and not no_skip:
+        if os.path.exists(out_path) and os.path.getsize(out_path) > 0 and not no_skip:
             skip += 1
             continue
         try:
@@ -161,7 +165,7 @@ def export_names(grp, names, skel_names, sub_out, stem, lod, no_skip):
     return ok, fail, skip, lines
 
 
-def export_pack(pack_path, pack_type, out_dir, game_dir, lod, match, no_skip, want_types):
+def export_pack(pack_path, pack_type, out_dir, game_dir, lod, match, no_skip, want_types, no_cockpit=False):
     """串行路径：导出一个 .grp 包（保持旧行为与旧日志顺序）。"""
     stem = os.path.splitext(os.path.basename(pack_path))[0]
     rel_dir = os.path.relpath(os.path.dirname(pack_path), game_dir)
@@ -177,7 +181,7 @@ def export_pack(pack_path, pack_type, out_dir, game_dir, lod, match, no_skip, wa
     if match:
         names = [n for n in names if match.lower() in n.lower()]
     print("-- [%s] %s" % (pack_type, pack_path))
-    ok, fail, skip, lines = export_names(grp, names, skel_names, sub_out, stem, lod, no_skip)
+    ok, fail, skip, lines = export_names(grp, names, skel_names, sub_out, stem, lod, no_skip, no_cockpit)
     for ln in lines:
         print(ln)
     return ok, fail, skip
@@ -241,6 +245,14 @@ def _worker_body(q, cfg, wid, pending, logq):
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump({"wid": wid, "packs": packs, "ok": ok, "fail": fail,
                        "skip": skip, "done": final}, f)
+        # 父进程每 0.5s 读取 wNN.stat；Windows 上目标文件被打开时 os.replace 会
+        # PermissionError(WinError 5)。短暂重试即可，不能让 worker 因此退出。
+        for _try in range(40):
+            try:
+                os.replace(tmp, stat_path)
+                return
+            except PermissionError:
+                time.sleep(0.02)
         os.replace(tmp, stat_path)
 
     dump_stat()
@@ -270,6 +282,8 @@ def _worker_body(q, cfg, wid, pending, logq):
                   ["[跳过] 无法打开 %s : %s" % (pack_path, ex)])
             fail += 1
             packs += 1
+            with pending.get_lock():
+                pending.value -= 1
             dump_stat()
             continue
         if cfg["match"]:
@@ -292,7 +306,7 @@ def _worker_body(q, cfg, wid, pending, logq):
         sub_out = os.path.join(cfg["out"], rel_dir) if rel_dir != "." else cfg["out"]
         os.makedirs(sub_out, exist_ok=True)
         a, b, c, lines = export_names(grp, names, skel_names, sub_out, stem,
-                                      cfg["lod"], cfg["no_skip"])
+                                      cfg["lod"], cfg["no_skip"], cfg.get("no_cockpit", False))
         ok += a; fail += b; skip += c; packs += 1
         logf.write("-- [%s] %s  (%d 个资源: 导出%d 失败%d 跳过%d)\n" % (
             pack_type, pack_path, len(names), a, b, c))
@@ -341,7 +355,7 @@ def _read_stats(wlog):
 
 
 def run_parallel(packs, out_dir, game_dir, lod, match, no_skip, workers,
-                 chunk, split, wlog, quiet=False):
+                 chunk, split, wlog, no_cockpit=False, quiet=False):
     """并行导出。返回 (ok, fail, skip)。packs 为 [(路径, 类型)]。"""
     import multiprocessing as mp
     os.makedirs(wlog, exist_ok=True)
@@ -355,7 +369,8 @@ def run_parallel(packs, out_dir, game_dir, lod, match, no_skip, workers,
     q = ctx.Queue()
     logq = ctx.Queue()          # worker -> 父进程 的结构化日志行
     cfg = {"out": out_dir, "game_dir": game_dir, "lod": lod, "match": match,
-           "no_skip": no_skip, "chunk": chunk, "split": split, "wlog": wlog}
+           "no_skip": no_skip, "chunk": chunk, "split": split, "wlog": wlog,
+           "no_cockpit": no_cockpit}
     pending = ctx.Value("i", 0)
     with pending.get_lock():
         pending.value = len(packs)
@@ -392,7 +407,7 @@ def run_parallel(packs, out_dir, game_dir, lod, match, no_skip, workers,
     bad = [p.exitcode for p in procs if p.exitcode not in (0, None)]
     if bad:
         print("[警告] 有 %d 个 worker 非正常退出，退出码：%s" % (len(bad), bad))
-    return st["ok"], st["fail"], st["skip"]
+    return st["ok"], st["fail"], st["skip"], len(bad)
 
 
 def main():
@@ -414,7 +429,13 @@ def main():
     ap.add_argument("--exclude-keywords", default=",".join(SCENERY_KEYWORDS),
                     help="按包名分词排除（默认场景/建筑/植被词表）；空串表示不排除")
     ap.add_argument("--no-exclude", action="store_true", help="关闭默认的场景/建筑/植被排除")
+    ap.add_argument("--no-base", action="store_true",
+                    help="不导出 base 类型资源（场景/树木/建筑/特效等）")
+    ap.add_argument("--no-cockpit", action="store_true",
+                    help="不导出座舱独立资源：跳过节 cockpit 类型包，以及 aircrafts/tanks/ships 包里名字含 _cockpit 的独立 OBJ")
     ap.add_argument("--worker-log-dir", default=None, help="子进程日志目录")
+    ap.add_argument("--allow-failures", action="store_true",
+                    help="有资源失败仍返回 0（用于已知不支持格式/场景资源的定向重导；默认返回非 0）")
     args = ap.parse_args()
 
     want = args.type.lower()
@@ -424,6 +445,10 @@ def main():
         if want not in TYPES:
             ap.error("未知类型 %r，可选 %s/ALL" % (args.type, "/".join(TYPES)))
         want_types = {want}
+    if args.no_base:
+        want_types.discard("base")
+    if args.no_cockpit:
+        want_types.discard("cockpits")
 
     # 游戏目录：命令行缺省时交互询问，避免把某台机器的安装路径写死在脚本里
     game_dir = args.game_dir
@@ -456,7 +481,7 @@ def main():
     print("输出目录：%s" % args.out)
     if args.packs_file:
         with open(args.packs_file, encoding="utf-8") as f:
-            listed = [ln.strip() for ln in f if ln.strip() and not ln.startswith("#")]
+            listed = [ln.strip().lstrip("\ufeff") for ln in f if ln.strip() and not ln.startswith("#")]
         packs = [(p, type_of_grp(p, os.path.join(args.game_dir, "content", "base", "res")))
                  for p in listed]
         print("按 --packs-file 限定 %d 个包" % len(packs))
@@ -474,24 +499,31 @@ def main():
     print("并行进程数：%d" % workers)
 
     t0 = time.time()
+    bad_workers = 0
     if workers == 1:
         total_ok = total_fail = total_skip = 0
         for pack_path, pack_type in packs:
             ok, fail, skip = export_pack(pack_path, pack_type, args.out, args.game_dir,
-                                         args.lod, args.match, args.no_skip, want_types)
+                                         args.lod, args.match, args.no_skip, want_types,
+                                         args.no_cockpit)
             total_ok += ok; total_fail += fail; total_skip += skip
         print("完成：导出 %d，失败 %d，跳过 %d" % (total_ok, total_fail, total_skip))
     else:
         print("子进程日志：%s" % wlog)
-        total_ok, total_fail, total_skip = run_parallel(
+        total_ok, total_fail, total_skip, bad_workers = run_parallel(
             packs, args.out, args.game_dir, args.lod, args.match, args.no_skip,
-            workers, args.chunk, args.split, wlog)
-        print("完成：导出 %d，失败 %d，跳过 %d" % (total_ok, total_fail, total_skip))
+            workers, args.chunk, args.split, wlog, args.no_cockpit)
+        print("完成：导出 %d，失败 %d，跳过 %d，异常worker %d" % (
+            total_ok, total_fail, total_skip, bad_workers))
     print("用时：%.1f s" % (time.time() - t0))
     if args.match:
         print("仅前 8 个命中文件写入各 worker 日志；总计见上。")
     if total_fail:
         print("失败明细见：%s" % wlog)
+    # 失败/worker 崩溃必须让调用方（all_unpack.ps1）看到非 0；否则会误清理并删掉满挂载中转。
+    # 资源级失败可由 --allow-failures 放行（已知不支持的资源）；worker 崩溃必须始终非 0。
+    if bad_workers or (total_fail and not args.allow_failures):
+        sys.exit(1)
 
 
 if __name__ == "__main__":

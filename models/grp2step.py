@@ -129,7 +129,8 @@ def model_geometry(mdl, raw_first=None):
             node = skeleton.getNodeByName(o.name)
             if node is not None:
                 wtm = node.wtm
-        objs.append({"name": o.name, "faces": [tuple(f) for f in o.faces], "wtm": wtm})
+        objs.append({"name": o.name, "faces": [tuple(f) for f in o.faces], "wtm": wtm,
+                     "skinned": bool(getattr(o, "skinned", False))})
     return verts, objs
 
 
@@ -142,24 +143,109 @@ def part_points(verts, o):
     return {i: (xform(wtm, verts[i]) if wtm is not None else mirror_raw(verts[i])) for i in used}
 
 
+def _obj_pts(verts, o):
+    if "wtm" in o:
+        return part_points(verts, o)
+    used = set()
+    for f in o["faces"]:
+        used.update(f)
+    return {i: verts[i] for i in used}
+
+
+def _bbox(points):
+    if not points:
+        return None
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    zs = [p[2] for p in points]
+    return (min(xs), min(ys), min(zs)), (max(xs), max(ys), max(zs))
+
+
+def _is_sliver_face(pts, face, min_edge=5.0, max_aspect=1000.0):
+    """超长且极窄的三角形：典型是导出/骨骼异常拉出的白线，不是真实翼面。
+    真实天线/拉线的长宽比通常 < 500；这里只删 >1000 的极端退化面。"""
+    try:
+        a, b, c = pts[face[0]], pts[face[1]], pts[face[2]]
+    except Exception:
+        return False
+    e1 = ((a[0]-b[0])**2 + (a[1]-b[1])**2 + (a[2]-b[2])**2) ** 0.5
+    e2 = ((b[0]-c[0])**2 + (b[1]-c[1])**2 + (b[2]-c[2])**2) ** 0.5
+    e3 = ((c[0]-a[0])**2 + (c[1]-a[1])**2 + (c[2]-a[2])**2) ** 0.5
+    mx = max(e1, e2, e3)
+    if mx < min_edge:
+        return False
+    ux, uy, uz = b[0]-a[0], b[1]-a[1], b[2]-a[2]
+    vx, vy, vz = c[0]-a[0], c[1]-a[1], c[2]-a[2]
+    cx, cy, cz = uy*vz-uz*vy, uz*vx-ux*vz, ux*vy-uy*vx
+    area = 0.5 * (cx*cx + cy*cy + cz*cz) ** 0.5
+    if area <= 0:
+        return True
+    aspect = mx / max(2.0 * area / mx, 1e-12)
+    return aspect > max_aspect
+
+
 def write_obj(path, verts, objs):
     """写 OBJ，保证每个零件互相拓扑独立：
     - 每个子部件(g 组)写出【自己的一套顶点】并应用自己的骨骼 wtm 变换；
       共享顶点流的对称部件各自变换到自己应在的一侧/位置。
     - 零件之间不共享顶点索引，导入后不会被焊接成一整个。
-    - 兼容旧格式 objs（无 'wtm' 字段时视为已预变换，直接写 verts）。"""
-    # 拼接后一次写出；格式串与逐行写出相同，字节结果不变。
+    - 兼容旧格式 objs（无 'wtm' 字段时视为已预变换，直接写 verts）。
+
+    蒙皮异常件：daelib 不提供 skin weight/绑定姿态，skinned 件的原始顶点是模型根空间，
+    直接写出会被拉成横跨整机的超长细面（实测 j_16 的 gear_c13/14、座舱 skin）。
+    这里用非蒙皮件 bbox 做参照，丢弃明显越界的 skinned 组并显式告警，避免把错误几何
+    当成正常件交付。"""
     out = ["# exported by grp2step.py (Dagor .grp -> OBJ)\n",
            "# 每零件独立顶点+自身骨骼变换，共享顶点流不再串位\n"]
+    pts_list = [_obj_pts(verts, o) for o in objs]
+    base_pts = []
+    for o, pts in zip(objs, pts_list):
+        nm = (o.get("name") or "").strip().lower()
+        # 特效面（螺旋桨盘/尾焰/曳光）跨度远超机体，不能作为 bbox 参照；否则蒙皮异常件
+        # 会被这些假面"包住"而漏检（j_16 的 gear_c13/14 就是这样漏掉的）。
+        is_fx = nm.startswith(("prop0", "prop", "jet_flame", "flare"))
+        if not o.get("skinned") and not is_fx:
+            base_pts.extend(pts.values())
+    base = _bbox(base_pts)
+    if base is not None:
+        blo, bhi = base
+        diag = max(1e-6, ((bhi[0]-blo[0])**2 + (bhi[1]-blo[1])**2 + (bhi[2]-blo[2])**2) ** 0.5)
+        margin = max(1.5, 0.15 * diag)
+    else:
+        margin = None
     seen = {}
-    vert_offset = 0  # 已写出的顶点总数（OBJ 里顶点索引是全局递增的）
-    for o in objs:
+    vert_offset = 0
+    dropped = 0
+    dropped_fx = 0
+    dropped_faces = 0
+    for o, pts in zip(objs, pts_list):
         name = (o.get("name") or "").strip() or "part"
         faces = o["faces"]
         if len(faces) == 0:
             continue
-        pts = part_points(verts, o) if "wtm" in o else None
-        # 收集该零件实际用到的顶点（按出现顺序去重），旧全局索引 -> 本零件内局部索引
+        nm = name.lower()
+        if nm.startswith(("prop", "jet_flame", "flare")):
+            # 螺旋桨盘/尾焰/曳光在 OBJ 里是几块贯穿全机的超长特效面；满挂载模式也去掉，
+            # 否则查看器里就是一条横穿模型的白色亮线。武器/挂架不受影响。
+            dropped_fx += 1
+            continue
+        if o.get("skinned") and margin is not None:
+            b = _bbox(pts.values())
+            if b is not None:
+                lo, hi = b
+                outside = any(lo[i] < blo[i] - margin or hi[i] > bhi[i] + margin for i in range(3))
+                if outside:
+                    dropped += 1
+                    print("[警告] 丢弃蒙皮异常组 %s bbox=(%.1f,%.1f,%.1f)..(%.1f,%.1f,%.1f)" % (
+                        name, lo[0], lo[1], lo[2], hi[0], hi[1], hi[2]))
+                    continue
+        # 删除极端细长面（白线）；保留正常翼面/天线。
+        good_faces = [f for f in faces if not _is_sliver_face(pts, f)]
+        if len(good_faces) != len(faces):
+            dropped_faces += len(faces) - len(good_faces)
+            faces = good_faces
+            if not faces:
+                continue
         remap = {}
         local = []
         for face in faces:
@@ -167,28 +253,27 @@ def write_obj(path, verts, objs):
                 if idx not in remap:
                     remap[idx] = len(local)
                     local.append(idx)
-        # 组名去重，避免同名零件在查看器里被归类成一个
         if name in seen:
             seen[name] += 1
             name = "%s_%02d" % (name, seen[name])
         else:
             seen[name] = 0
         out.append("g %s\n" % name)
-        if pts is None:
-            for idx in local:
-                v = verts[idx]
-                out.append("v %.6f %.6f %.6f\n" % (v[0], v[1], v[2]))
-        else:
-            for idx in local:
-                v = pts[idx]
-                out.append("v %.6f %.6f %.6f\n" % (v[0], v[1], v[2]))
+        for idx in local:
+            v = pts[idx]
+            out.append("v %.6f %.6f %.6f\n" % (v[0], v[1], v[2]))
         off = vert_offset
         for a, b, c in faces:
-            # Z 镜像后翻转绕序，保持法线朝外
             out.append("f %d %d %d\n" % (off + remap[a] + 1,
                                           off + remap[c] + 1,
                                           off + remap[b] + 1))
         vert_offset += len(local)
+    if dropped:
+        print("[警告] 共丢弃 %d 个蒙皮异常组（skin weight/bind pose 未解析）" % dropped)
+    if dropped_fx:
+        print("[警告] 共丢弃 %d 个螺旋桨/尾焰特效组（避免超长白线）" % dropped_fx)
+    if dropped_faces:
+        print("[警告] 共丢弃 %d 个极端细长面（白线）" % dropped_faces)
     with open(path, "w", encoding="utf-8") as f:
         f.write("".join(out))
     return path
