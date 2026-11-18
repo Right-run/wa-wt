@@ -41,7 +41,3 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "C:\Users\Administrator\Desk
 注意powershell 5编码格式应为UTF-8 with BOM，powershell 7可用UTF-8
 
 本版移除了场景/建筑/植被
-
-目前存在的问题：
-
-顶点流声明format=14, stride=20，格式表里没有format14这一项。20 字节内要放3个顶点分量（6或12字节）+ 2个UV分量（4或8字节）【DSH完成的解析，作者暂未验证但错误存在，影响约20个同字段布局】
